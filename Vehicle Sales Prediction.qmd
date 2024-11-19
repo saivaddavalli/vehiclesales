@@ -1,0 +1,366 @@
+---
+title: "6302 Final Project"
+author: Sai Vaddavalli
+format: 
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+    code-line-numbers: true
+    code-summary: "SHOW ME THE CODE!"
+    code-tools: true
+editor: visual
+---
+
+```{r setup}
+#| message: false
+#| warning: false
+library(tidyverse)
+library(tidymodels)
+library(ISLR)
+library(finetune)
+library(probably)
+library(readr)
+library(caret)
+library(yardstick)
+library(factoextra)
+library(recipes)
+library(rsample)
+library(themis)
+library(forcats)
+library(vip)
+```
+
+```{r}
+cars <- read_csv("E:/Downloads/car_prices.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Define the number of samples
+sample_size <- 10000  
+
+# Randomly sample from the dataset
+sampled_data <- cars[sample(nrow(cars), sample_size, replace = FALSE), ]
+
+# View the sampled data
+head(sampled_data)
+```
+
+```{r}
+# Count missing values in each column
+missing_values <- colSums(is.na(sampled_data))
+
+# Print the results
+print(missing_values)
+```
+
+```{r}
+# Remove columns saledate, seller, and vin
+cars_clean <- sampled_data %>%
+  select(-c(saledate, seller, vin))
+
+# Remove all observations with missing values
+cars_clean <- na.omit(cars_clean)
+
+missing_values <- colSums(is.na(cars_clean))
+
+# Print the results
+print(missing_values)
+```
+
+## Exploratory Analysis
+
+```{r}
+# Calculate average selling price by make, body, and transmission
+avg_price_by_make <- cars_clean %>%
+  group_by(make) %>%
+  summarise(avg_sellingprice = mean(sellingprice, na.rm = TRUE)) %>%
+  arrange(desc(avg_sellingprice)) %>%
+  top_n(10)
+
+avg_price_by_body <- cars_clean %>%
+  group_by(body) %>%
+  summarise(avg_sellingprice = mean(sellingprice, na.rm = TRUE)) %>%
+  arrange(desc(avg_sellingprice)) %>%
+  top_n(10)
+
+
+# Create bar plot for make
+barplot_make <- ggplot(avg_price_by_make, aes(x = reorder(make, -avg_sellingprice), y = avg_sellingprice, fill = avg_sellingprice)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Make", y = "Average Selling Price", title = "Top 10 Makes by Average Selling Price") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display the plot for make
+print(barplot_make)
+
+# Create bar plot for body
+barplot_body <- ggplot(avg_price_by_body, aes(x = reorder(body, -avg_sellingprice), y = avg_sellingprice, fill = avg_sellingprice)) +
+  geom_bar(stat = "identity") +
+  labs(x = "Body Type", y = "Average Selling Price", title = "Top 10 Body Types by Average Selling Price") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Display the plot for body
+print(barplot_body)
+```
+
+```{r}
+# Calculate average selling price by year
+avg_price_by_year <- cars_clean %>%
+  group_by(year) %>%
+  summarise(avg_sellingprice = mean(sellingprice, na.rm = TRUE))
+
+# Create time series plot
+ts_plot <- ggplot(avg_price_by_year, aes(x = year, y = avg_sellingprice)) +
+  geom_line() +
+  labs(x = "Year", y = "Average Selling Price", title = "Average Selling Price By Manufacturing Year") +
+  theme_minimal()
+
+# Display the plot
+print(ts_plot)
+```
+
+## Penalized Regression
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Define the recipe for data preprocessing
+preprocess_recipe <- recipe(sellingprice ~ ., data = cars_clean) %>%
+                     step_dummy(all_nominal(), -all_outcomes()) %>%
+                     step_normalize(all_numeric(), -all_outcomes()) 
+
+# Apply preprocessing and align levels
+preprocess_results <- preprocess_recipe %>%
+  prep(data = cars_clean) %>%
+  bake(new_data = cars_clean)  # Apply preprocessing to the entire dataset
+
+# Split the preprocessed data into train and test sets
+split <- initial_split(preprocess_results, prop = 0.8)
+cars_train <- training(split)
+cars_test <- testing(split)
+
+
+# Define the recipe for the training set
+preprocess_recipe <- recipe(sellingprice ~ ., data = cars_train)
+
+# Define the cross-validation specification
+kfolds <- vfold_cv(cars_train, v = 5)
+
+# Define the linear regression model specification
+linear_spec <- linear_reg(penalty = tune(), mixture = tune()) %>% 
+               set_mode("regression") %>%
+               set_engine("glmnet")
+
+# Create a tidymodels workflow
+workflow <- workflow() %>%
+            add_recipe(preprocess_recipe) %>%
+            add_model(linear_spec)
+# Define control parameters for resampling
+ctrl <- control_resamples(save_pred = TRUE)
+
+# Define custom metric set
+metrics <- metric_set(
+  rmse = rmse,
+  rsq = rsq,
+  mae = mae
+)
+
+# Tune the hyperparameters
+cars_tune <- tune_grid(
+  workflow,
+  resamples = kfolds,
+  grid = 20,  
+  metrics = metric_set(rmse, mae)
+)
+
+# Show the best tuning parameters based on RMSE
+cars_tune %>% show_best(metric = "rmse")
+
+# Select the best tuning parameters based on RMSE
+best_model <- cars_tune %>% select_best(metric = "rmse")
+
+# Fit the best model
+trained_model <- workflow %>%
+                  finalize_workflow(best_model) %>%
+                  fit(data = cars_train)
+
+# Make predictions on the test set
+test_predictions <- predict(trained_model, new_data = cars_test)
+
+test_data <- data.frame(
+  sellingprice = cars_test$sellingprice,
+  predicted_price = test_predictions$.pred
+)
+
+# View evaluation metrics
+eval_metrics <- metrics(test_data, truth = sellingprice, estimate = predicted_price)
+
+# Display evaluation metrics
+eval_metrics
+```
+
+## Random Forest
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Define the random forest model specification
+rf_spec <- rand_forest(
+  mtry = tune(), # Tuning parameter for the number of variables randomly sampled as candidates at each split
+  min_n = tune(), # Tuning parameter for the minimum number of data points required to split a node
+  trees = tune()
+) %>% 
+set_mode("regression") %>%
+set_engine("ranger")
+
+# Create a tidymodels workflow
+workflow <- workflow() %>%
+            add_recipe(preprocess_recipe) %>%
+            add_model(rf_spec)
+
+# Create a space-filling design for tuning parameters
+rf_param <- extract_parameter_set_dials(rf_spec) %>%
+           finalize(juice(prep(preprocess_recipe)))
+
+glh_rf <- grid_latin_hypercube(rf_param, size = 3)
+
+# Tune the model
+tuned_model_rf <- workflow %>%
+               tune_grid(resamples = kfolds, grid = glh_rf, control = ctrl, metrics = metrics)
+
+# Show the best tuning parameters based on RMSE
+tuned_model %>% show_best(metric = "rmse")
+
+# Select the best tuning parameters based on RMSE
+best_model <- tuned_model %>% select_best(metric = "rmse")
+
+# Fit the best model
+trained_model_rf <- workflow %>%
+                  finalize_workflow(best_model) %>%
+                  fit(data = cars_train)
+
+# Save the final fitted model as an RDS file
+saveRDS(trained_model_rf, "E:/Downloads/final_rf_model.rds")
+
+# Make predictions on the test set
+test_predictions <- predict(trained_model_rf, new_data = cars_test)
+
+test_data <- data.frame(
+  sellingprice = cars_test$sellingprice,
+  predicted_price = test_predictions$.pred
+)
+
+# View evaluation metrics
+eval_metrics_rf <- metrics(test_data, truth = sellingprice, estimate = predicted_price)
+
+# Display evaluation metrics
+eval_metrics_rf
+```
+
+## Stochastic Gradient Boosting Model
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Define the Stochastic Gradient Boosting model specification
+sgb_spec <- boost_tree(
+                  mode = "regression",
+                  mtry = tune(),
+                  trees = tune(),
+                  min_n = tune(),
+                  tree_depth = tune(),
+                  learn_rate = tune(),
+                  loss_reduction = tune(),
+                  sample_size = tune(),
+                  stop_iter = tune()) %>%
+                  set_engine("xgboost")
+
+# Create a tidymodels workflow
+workflow <- workflow() %>%
+  add_recipe(preprocess_recipe) %>%
+  add_model(sgb_spec)
+
+# Create a space-filling design for tuning parameters
+sgb_param <- extract_parameter_set_dials(sgb_spec) %>%
+  finalize(juice(prep(preprocess_recipe)))
+
+glh_sgb <- grid_latin_hypercube(sgb_param, size = 3)  # Adjust size as needed
+
+# Tune the model
+tuned_model <- workflow %>%
+  tune_grid(
+    resamples = kfolds, 
+    grid = glh_sgb,
+    control = ctrl,
+    metrics = metrics
+  )
+
+# Show the best tuning parameters based on RMSE
+tuned_model %>% show_best(metric = "rmse")
+
+# Select the best tuning parameters based on RMSE
+best_model <- tuned_model %>% select_best(metric = "rmse")
+
+# Fit the best model
+trained_model_sgb <- workflow %>%
+  finalize_workflow(best_model) %>%
+  fit(data = cars_train)
+
+# Save the final fitted model as an RDS file
+saveRDS(trained_model_sgb, "E:/Downloads/final_sgb_model.rds")
+
+# Make predictions on the test set
+test_predictions <- predict(trained_model_sgb, new_data = cars_test)
+
+test_data <- data.frame(
+  sellingprice = cars_test$sellingprice,
+  predicted_price = test_predictions$.pred
+)
+
+# View evaluation metrics
+eval_metrics_sgb <- metrics(test_data, truth = sellingprice, estimate = predicted_price)
+
+# Display evaluation metrics
+eval_metrics_sgb
+```
+
+## Feature Importance
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Define the random forest model specification
+rf_spec <- rand_forest(
+  trees = 682, 
+  mtry = 1064, 
+  min_n = 29   
+) %>% 
+set_mode("regression") %>%
+set_engine("ranger", importance = "impurity")
+
+# Create a tidymodels workflow
+workflow <- workflow() %>%
+            add_recipe(preprocess_recipe) %>%
+            add_model(rf_spec)
+
+# Fit the model
+trained_model <- workflow %>%
+                  fit(data = cars_train)
+```
+
+```{r}
+# Variable importance plot
+vip(trained_model)
+```
